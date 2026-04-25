@@ -5,7 +5,6 @@
 // https://github.com/bigevtaylor/arduino-swc
 // MCP 4151-104E (100kOhm) wird verwendet (Pin1->CS, Pin2->CLK, Pin3->SDO, Pin4->GND, Pin5->Pin 7(B)->GND, Pin 8->+5V)
 // https://github.com/PaulusElektrus/Arduino_and_MCP4151/blob/master/MCP4151-U-Messung_Steckplatine.png (aber stimmt nicht ganz mit der Messung)
-// https://chat.deepseek.com/a/chat/s/3625d257-cad1-4079-ba06-69666c14984b
 
 // ============================================================
 // Pioneer SPH-DA77DAB - Drehencoder (Vol+/Vol-) + Taster (Mute)
@@ -39,8 +38,9 @@
 // ============================================================
 
 #include <Arduino.h>
+//#include <SPI.h>
+//#include <MCP4151.h>
 #include "mcp4151_soft_spi.h"
-#include <Encoder.h>
 
 // LED Pin
 constexpr uint8_t LED_PIN     =  13;  // Default built-in LED is on digital pin 13)
@@ -48,6 +48,8 @@ constexpr uint8_t LED_PIN     =  13;  // Default built-in LED is on digital pin 
 // Encoder Pins
 constexpr uint8_t ENCODER_A   =  2;   // musst be Interrupt capable
 constexpr uint8_t ENCODER_B   =  3;   // musst be Interrupt capable
+//constexpr uint8_t ENCODER_A   =  3;   // musst be Interrupt capable
+//constexpr uint8_t ENCODER_B   =  2;   // musst be Interrupt capable
 constexpr uint8_t ENCODER_SW  =  4;   // SW = Mute
 
 // MCP4151 Software-SPI Pins (alle frei wählbar, KEIN Pin 13!)
@@ -62,46 +64,64 @@ constexpr uint8_t FET_PIN   =  5;   // FET = OUT
 // Globale Objekte und Variablen
 // ============================================================
 
-// Objekte:
-// -----------
-
-// Encoder-Objekt: (PinA, PinB)
-// Wenn die Richtung falsch ist, tausche einfach die Pins: (ENCODER_B, ENCODER_A)
-Encoder myEncoder(ENCODER_A, ENCODER_B);
-
-// MCP4151 Objekt mit Software-SPI
-MCP4151_SoftSPI potentiometer(MCP_CS_PIN, MCP_SCK_PIN, MCP_DATA_PIN);
-
-// Variablen:
-// -----------
+// LED-Variablen
+unsigned long ledOffTime = 0;
+bool ledIsOn = false;
 
 // ---- Timing --------------------------------------------------
 constexpr uint16_t PULSE_MS      = 40; //50; //50 //150;  // Befehlsdauer ms
 constexpr uint8_t  BTN_DEBOUNCE  =  50;  // Taster ms
 
-// Verweilzeit nach Encoder-Drehung
+// ============================================================
+// Verbesserte Entprellungsparameter
+// ============================================================
+
+// WICHTIG: Werte müssen für DEINEN Encoder angepasst werden
+const unsigned long DEBOUNCE_TIME_US = 300;   // 800 Mikrosekunden (0,8ms)
+const unsigned long MIN_DETENT_TIME_US = 1500; // Mindestens 2ms zwischen zwei Rasten
+const unsigned long MAX_PULSE_TIME_US = 5000;  // Maximal 5ms für einen kompletten Puls
+
+// Encoder-Zustandsmaschine
+enum EncoderState {
+    ENC_IDLE,
+    ENC_CW_DETECTED,
+    ENC_CCW_DETECTED,
+    ENC_WAITING_FOR_REST
+};
+
+volatile int encoderValue = 128;
+volatile bool encoderChanged = false;
+volatile int lastEncoded = 0;
+
+// Entprellung
+volatile unsigned long lastInterruptTime = 0;
+const unsigned long interruptDebounce = 1000; // 1ms
+
+// Verbesserte Entprellungsvariablen
+volatile unsigned long lastPulseTime = 0;
+volatile unsigned long lastCwTime = 0;
+volatile unsigned long lastCcwTime = 0;
+volatile EncoderState encState = ENC_IDLE;
+volatile int lastClkState;
+volatile int lastDtState;
+
+// Für zusätzliche Filterung
+volatile int stableClkState;
+volatile int stableDtState;
+volatile unsigned long lastStableChangeTime = 0;
+
+// Verweilzeit Variablen
 unsigned long waitStartTime = 0;
 bool isWaiting = false;
 
-// Verweilzeit nach Taster (Encoder-Pause)
-bool encoderPaused = false;           // Encoder pausiert?
-unsigned long encoderPauseEndTime = 0; // Wann endet die Pause?
-const unsigned long encoderPauseDuration = 400; // 400ms Pause nach Taster
 
-// Wichtig: Speichert den Wert vor der Pause
-int positionBeforePause = 0;
 
-// Für die Positionsverwaltung
-int currentPosition = 128;      // Aktuelle Position (0-257)
-int lastPosition = -1;          // Letzte Position für Änderungserkennung
-
-// LED-Variablen
-unsigned long ledOffTime = 0;
-bool ledIsOn = false;
-
-// für die Befehlsausgabe
+//deepseek
+// https://chat.deepseek.com/a/chat/s/3625d257-cad1-4079-ba06-69666c14984b
 volatile int counter = 0;
+volatile int potentiometerValue = 255;   // Startwert
 volatile uint8_t command;
+
 
 // Für den MUTE-Button
 bool     lastBtnState = HIGH;
@@ -112,6 +132,10 @@ bool     btnHandled    = false;  // verhindert Mehrfachauslösung
 constexpr uint8_t MCP4151_WRITE = 0x00;
 constexpr uint8_t MCP4151_SHUTDOWN = 0x08;  // Wiper trennen (Hi-Z)
           
+//const byte MUTE = 9;      // 3.5kOhm
+//const byte VOL_UP = 41;   // 16kOhm
+//const byte VOL_DOWN = 61; // 24kOhm
+
 constexpr uint8_t POS_IDLE   = 255;  //181;  // ~71 kΩ  Ruhezustand
 constexpr uint8_t POS_VOL_UP =  41;  // ~16 kΩ  Vol+
 constexpr uint8_t POS_VOL_DOWN =  61;  // ~24 kΩ  Vol-
@@ -120,9 +144,14 @@ constexpr uint8_t POS_MUTE   =   9;  // ~ 3.5kΩ Mute -> ATT !
 #define OUT_ON  digitalWrite(FET_PIN, HIGH);
 #define OUT_OFF digitalWrite(FET_PIN, LOW);
 
+// MCP4151 Objekt mit Software-SPI
+MCP4151_SoftSPI potentiometer(MCP_CS_PIN, MCP_SCK_PIN, MCP_DATA_PIN);
+
 // ---- Prototypen ----------------------------------------------
 void flashLED(uint16_t duration);
+void encoderInterrupt();
 void sendCommand(uint8_t pos);
+void logPulseInterval(unsigned long now);
 
 void setup() {
   delay(500); // some microcontrollers reboot twice
@@ -132,12 +161,17 @@ void setup() {
     while (!Serial) {
       ; // Warte auf Serial-Port (nur relevant für bestimmte Boards)
     }
-    Serial.println("\n=== Encoder mit Library ===");
-    Serial.println("Encoder Bibliothek von Paul Stoffregen");
-    Serial.println("=======================================\n");
     Serial.println(F("Serial initialized."));
     Serial.println(F("setup(): begin"));
   #endif
+
+  // MCP4151 via HARDWARE SPI
+  //pinMode(MCP_CS_PIN, OUTPUT);
+  //digitalWrite(MCP_CS_PIN, HIGH);
+  //SPI.begin();
+  //SPI.setDataMode(SPI_MODE0);
+  //SPI.setBitOrder(MSBFIRST);
+  //SPI.setClockDivider(SPI_CLOCK_DIV16); // ~1 MHz
 
   // Software-SPI initialisieren (kein hardware SPI!)
   potentiometer.begin();
@@ -153,10 +187,17 @@ void setup() {
   // Mute-Taster
   pinMode(ENCODER_SW, INPUT_PULLUP);  // button to GND
 
-  // Encoder auf Startwert setzen
-  // Die Bibliothek zählt in 4er-Schritten. Wir teilen durch 4 für 0-257
-  myEncoder.write(currentPosition * 4);
+  // Initialen Zustand lesen
+  lastEncoded = (digitalRead(ENCODER_A) << 1) | digitalRead(ENCODER_B);
   
+  // Interrupts auf beide Pins für maximale Reaktionsfähigkeit
+  attachInterrupt(digitalPinToInterrupt(ENCODER_A), encoderInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_B), encoderInterrupt, CHANGE);
+  
+  // Speichere den Anfangszustand von CLK
+  lastClkState = digitalRead(ENCODER_A);
+  lastDtState = digitalRead(ENCODER_B);
+
   // Initialen Wert MPC4151 setzen
   potentiometer.setMid();
 
@@ -173,114 +214,35 @@ void setup() {
   #ifdef DEBUG_MODE
     Serial.println(F("Pioneer SWC bereit. Vol+/Vol-/Mute aktiv."));
   #endif
+
+  // Test: Rohsignale ausgeben
+    Serial.println("=== Rohsignal-Test ===");
+    Serial.println("Drehe langsam am Encoder...");
 }
 
 void loop() {
   if (ledIsOn && (millis() >= ledOffTime)) {
-    digitalWrite(LED_PIN, LOW);
-    ledIsOn = false;
-  }
-
-  // Encoder-Pause nach Taster prüfen
-  if (encoderPaused && btnHandled == false && (millis() >= encoderPauseEndTime)) {
-    encoderPaused = false;
-    #ifdef DEBUG_MODE
-      Serial.println("Encoder-Pause beendet - Encoder reagiert wieder!");
-    #endif
-    myEncoder.write(positionBeforePause * 4); // Encoder auf alten Wert zurückgesetzt!
-    flashLED(100);  // Kurzes Feedback: Pause vorbei
-  }
-    
-  // === ENCODER AUSLESEN (das Herzstück) ===
-  // Die Bibliothek erledigt die ganze harte Arbeit:
-  // - Entprellung
-  // - Interrupts
-  // - Richtungserkennung
-
-  // ENCODER AUSLESEN (nur wenn nicht pausiert)
-  if (!encoderPaused) {
-    long rawPosition = myEncoder.read();     // Rohwert (0-1028 für 0-257)
-    int newPosition = rawPosition / 4;       // Umrechnung auf 0-257
-
-    // Nur bei Änderung etwas tun
-    if (newPosition != lastPosition) {
-      if (newPosition > lastPosition) {
-        #ifdef DEBUG_MODE
-          Serial.println(F("DREHUNG: VOL+"));
-        #endif
-        sendCommand(POS_VOL_UP);
-      } else {
-        #ifdef DEBUG_MODE
-          Serial.println(F("DREHUNG: VOL-"));
-        #endif
-        sendCommand(POS_VOL_DOWN);
-      }
+        digitalWrite(LED_PIN, LOW);
+        ledIsOn = false;
     }
     
-    // Begrenzung auf 0-257
-    if (newPosition < 0) {
-      newPosition = 0;
-      myEncoder.write(0);
+ if (encoderChanged && !isWaiting) {
+        noInterrupts();
+        int localValue = encoderValue;
+        encoderChanged = false;
+        interrupts();
+        
+        if (localValue < 0) localValue = 0;
+        if (localValue > 257) localValue = 257;
+        
+        potentiometer.writeValue(localValue);
+        Serial.print("Wiper: ");
+        Serial.println(localValue);
+        
+        waitStartTime = millis();
+        isWaiting = true;
+        flashLED(50);
     }
-    if (newPosition > 257) {
-      newPosition = 257;
-      myEncoder.write(257 * 4);
-    }
-    
-    // Nur bei Änderung etwas tun
-    if (newPosition != lastPosition) {
-      lastPosition = newPosition;
-       
-      Serial.print("Position: ");
-      Serial.println(newPosition);
-      flashLED(100);
-    }
-  }
-
-  // ---- Mute-Taster (saubere Flankenauswertung) ---------------
-  bool buttonState = digitalRead(ENCODER_SW);
-
-  // Änderung erkannt → Timer neu starten
-  if (buttonState != lastBtnState) {
-    lastBtnTime = millis();
-  }
-  lastBtnState = buttonState;
-
-  // Erst nach Debounce-Zeit auswerten
-  if ((millis() - lastBtnTime) > BTN_DEBOUNCE) {
-    // Taster gedrückt (LOW) und noch nicht ausgeführt
-    if (buttonState == LOW && !btnHandled) {
-      // Encoder-Pause starten
-      encoderPaused = true;
-      //encoderPauseEndTime = millis() + 5000;
-      // WICHTIG: Aktuellen Encoder-Wert speichern
-      long currentRaw = myEncoder.read();
-      positionBeforePause = currentRaw / 4;
-      
-      #ifdef DEBUG_MODE
-        Serial.println(F("BUTTON PRESSED"));
-        Serial.println("Encoder-Pause...");
-        Serial.println(F("MUTE"));
-      #endif
-      sendCommand(POS_MUTE);
-      flashLED(50);  // Kurzes Feedback für Pausenstart
-      btnHandled = true;  // nicht nochmals auslösen bis losgelassen
-    }
-    // Taster wurde LOSGELASSEN (Übergang LOW -> HIGH) → 400ms Pause für Encoder
-    if (buttonState == HIGH && btnHandled) {
-      // Encoder-Pause starten
-      encoderPaused = true;
-      encoderPauseEndTime = millis() + encoderPauseDuration;
-
-      #ifdef DEBUG_MODE
-        Serial.println(F("BUTTON RELEASED"));
-        Serial.print("Encoder-Pause für weitere ");
-        Serial.print(encoderPauseDuration);
-        Serial.println("ms aktiviert");
-      #endif
-      btnHandled = false;
-    }
-  }
 }
 
 // ============================================================
@@ -292,6 +254,43 @@ void flashLED(uint16_t durationMs) {
   ledOffTime = millis() + durationMs;
 }
 
+// ============================================================
+// Verbesserte Encoder-Interrupt (erkennt beide Richtungen)
+// ============================================================
+
+void encoderInterrupt() {
+    // Entprellung
+    unsigned long now = micros();
+    if ((now - lastInterruptTime) < interruptDebounce) {
+        return;
+    }
+    lastInterruptTime = now;
+    
+    // Lese beide Pins
+    int clk = digitalRead(ENCODER_A);
+    int dt = digitalRead(ENCODER_B);
+    
+    // Kombiniere zu einem Zustand (0-3)
+    int encoded = (clk << 1) | dt;
+    
+    // Berechne die Übergänge
+    int sum = (lastEncoded << 2) | encoded;
+    
+    // Erkennung anhand der Zustandsmaschine
+    if (sum == 0b0010 || sum == 0b1011 || sum == 0b1101 || sum == 0b0100) {
+        // Im Uhrzeigersinn (CW)
+        if (encoderValue < 257) encoderValue++;
+        encoderChanged = true;
+    } 
+    else if (sum == 0b0001 || sum == 0b0111 || sum == 0b1110 || sum == 0b1000) {
+        // Gegen Uhrzeigersinn (CCW)
+        if (encoderValue > 0) encoderValue--;
+        encoderChanged = true;
+    }
+    
+    lastEncoded = encoded;
+}
+
 // ==============================================================
 // Befehl senden: kurzer Impuls, dann Ausgang offen
 void sendCommand(uint8_t pos) {
@@ -300,7 +299,28 @@ void sendCommand(uint8_t pos) {
   delayMicroseconds(5);
   OUT_ON
   delay(PULSE_MS);
+  //setWiper(POS_IDLE);
   OUT_OFF
+  //setIdle();   // statt setWiper(POS_IDLE)
+  //potentiometer.setMax();
   //delay(1);
   delayMicroseconds(5);
+}
+
+// Diese Funktion ganz oben bei den anderen Funktionen einfügen
+void logPulseInterval(unsigned long now) {
+    static unsigned long lastPulse = 0;
+    static unsigned long pulseCount = 0;
+    
+    unsigned long pulseInterval = now - lastPulse;
+    lastPulse = now;
+    pulseCount++;
+    
+    // Nur gelegentlich ausgeben, um den Serial-Puffer nicht zu überfluten
+    if (pulseCount % 50 == 0) {
+        Serial.print("Puls-Intervall (us): ");
+        Serial.print(pulseInterval);
+        Serial.print(" | Count: ");
+        Serial.println(pulseCount);
+    }
 }

@@ -1,0 +1,427 @@
+// https://funduino.de/nr-32-der-rotary-encoder-ky-040
+// zwischen grau (sleeve) und rot (tip) messe ich 15kOhm (oder 16kOhm) in eine Richtung und 24kOhm in die andere Richung beim Drehen des Encoders 
+// 3.5kOhm für Mute
+// https://forum.arduino.cc/t/steering-wheel-remote-audio-control/223878
+// https://github.com/bigevtaylor/arduino-swc
+// MCP 4151-104E (100kOhm) wird verwendet (Pin1->CS, Pin2->CLK, Pin3->SDO, Pin4->GND, Pin5->Pin 7(B)->GND, Pin 8->+5V)
+// https://github.com/PaulusElektrus/Arduino_and_MCP4151/blob/master/MCP4151-U-Messung_Steckplatine.png (aber stimmt nicht ganz mit der Messung)
+
+// ============================================================
+// Pioneer SPH-DA77DAB - Drehencoder (Vol+/Vol-) + Taster (Mute)
+// MCP4151-104 (100kΩ, SPI) + KY-040 Encoder
+// Arduino Nano — PlatformIO
+// ============================================================
+//
+// VERDRAHTUNG:
+//   MCP4151:
+//     Pin 1 (CS)   -> D9
+//     Pin 2 (SCK)  -> D10
+//     Pin 3 (SDI)  -> D11
+//     Pin 4 (VSS)  -> GND
+//     Pin 5 (PA0)  -> Pioneer SWC REM+  (weiss/braun)
+//     Pin 6 (PW0)  -> Pioneer SWC REM+  (PA0 + PW0 brücken!)
+//     Pin 7 (PB0)  -> GND
+//     Pin 8 (VDD)  -> 5V
+//
+//   KY-040:
+//     CLK -> D2   (Interrupt)
+//     DT  -> D3
+//     SW  -> D4   (Mute-Taster)
+//     +   -> 5V
+//     GND -> GND
+//
+//   Pioneer SWC-Kabel:
+//     REM+  (weiss/braun) -> MCP4151 Pin 5+6
+//     REM-  (schwarz)     -> GND
+//
+//   diesen MCP4151 unterstützt nicht open source output 04.04.2026
+// ============================================================
+
+#include <Arduino.h>
+//#include <SPI.h>
+//#include <MCP4151.h>
+#include "mcp4151_soft_spi.h"
+
+// LED Pin
+constexpr uint8_t LED_PIN     =  13;  // Default built-in LED is on digital pin 13)
+
+// Encoder Pins
+//constexpr uint8_t ENCODER_A   =  2;   // musst be Interrupt capable
+//constexpr uint8_t ENCODER_B   =  3;   // musst be Interrupt capable
+constexpr uint8_t ENCODER_A   =  3;   // musst be Interrupt capable
+constexpr uint8_t ENCODER_B   =  2;   // musst be Interrupt capable
+constexpr uint8_t ENCODER_SW  =  4;   // SW = Mute
+
+// MCP4151 Software-SPI Pins (alle frei wählbar, KEIN Pin 13!)
+constexpr uint8_t MCP_CS_PIN   = A3; //9;   // Chip Select
+constexpr uint8_t MCP_SCK_PIN  = A5; //10;  // SPI Clock
+constexpr uint8_t MCP_DATA_PIN = A4; //11;  // Serial Data In/Out
+
+// FET Pins
+constexpr uint8_t FET_PIN   =  5;   // FET = OUT
+
+// ============================================================
+// Globale Objekte und Variablen
+// ============================================================
+
+// LED-Variablen
+unsigned long ledOffTime = 0;
+bool ledIsOn = false;
+
+// ---- Timing --------------------------------------------------
+constexpr uint16_t PULSE_MS      = 40; //50; //50 //150;  // Befehlsdauer ms
+constexpr uint8_t  BTN_DEBOUNCE  =  50;  // Taster ms
+
+// ============================================================
+// Verbesserte Entprellungsparameter
+// ============================================================
+
+// WICHTIG: Werte müssen für DEINEN Encoder angepasst werden
+const unsigned long DEBOUNCE_TIME_US = 300;   // 800 Mikrosekunden (0,8ms)
+const unsigned long MIN_DETENT_TIME_US = 1500; // Mindestens 2ms zwischen zwei Rasten
+const unsigned long MAX_PULSE_TIME_US = 5000;  // Maximal 5ms für einen kompletten Puls
+
+// Encoder-Zustandsmaschine
+enum EncoderState {
+    ENC_IDLE,
+    ENC_CW_DETECTED,
+    ENC_CCW_DETECTED,
+    ENC_WAITING_FOR_REST
+};
+
+volatile int encoderValue = 128;
+volatile bool encoderChanged = false;
+
+// Verbesserte Entprellungsvariablen
+volatile unsigned long lastPulseTime = 0;
+volatile unsigned long lastCwTime = 0;
+volatile unsigned long lastCcwTime = 0;
+volatile EncoderState encState = ENC_IDLE;
+volatile int lastClkState;
+volatile int lastDtState;
+
+// Für zusätzliche Filterung
+volatile int stableClkState;
+volatile int stableDtState;
+volatile unsigned long lastStableChangeTime = 0;
+
+// Verweilzeit Variablen
+unsigned long waitStartTime = 0;
+bool isWaiting = false;
+
+//deepseek
+// https://chat.deepseek.com/a/chat/s/3625d257-cad1-4079-ba06-69666c14984b
+volatile int counter = 0;
+volatile int potentiometerValue = 255;   // Startwert
+volatile uint8_t command;
+
+
+// Für den MUTE-Button
+bool     lastBtnState = HIGH;
+uint32_t lastBtnTime  = 0;
+bool     btnHandled    = false;  // verhindert Mehrfachauslösung
+
+// --- MCP4151 Commands ---
+constexpr uint8_t MCP4151_WRITE = 0x00;
+constexpr uint8_t MCP4151_SHUTDOWN = 0x08;  // Wiper trennen (Hi-Z)
+          
+//const byte MUTE = 9;      // 3.5kOhm
+//const byte VOL_UP = 41;   // 16kOhm
+//const byte VOL_DOWN = 61; // 24kOhm
+
+constexpr uint8_t POS_IDLE   = 255;  //181;  // ~71 kΩ  Ruhezustand
+constexpr uint8_t POS_VOL_UP =  41;  // ~16 kΩ  Vol+
+constexpr uint8_t POS_VOL_DOWN =  61;  // ~24 kΩ  Vol-
+constexpr uint8_t POS_MUTE   =   9;  // ~ 3.5kΩ Mute -> ATT !
+
+#define OUT_ON  digitalWrite(FET_PIN, HIGH);
+#define OUT_OFF digitalWrite(FET_PIN, LOW);
+
+// MCP4151 Objekt mit Software-SPI
+MCP4151_SoftSPI potentiometer(MCP_CS_PIN, MCP_SCK_PIN, MCP_DATA_PIN);
+
+// ---- Prototypen ----------------------------------------------
+void flashLED(uint16_t duration);
+void encoderInterrupt();
+void sendCommand(uint8_t pos);
+void logPulseInterval(unsigned long now);
+
+void setup() {
+  delay(500); // some microcontrollers reboot twice
+
+  #ifdef DEBUG_MODE
+    Serial.begin(115200);
+    while (!Serial) {
+      ; // Warte auf Serial-Port (nur relevant für bestimmte Boards)
+    }
+    Serial.println(F("Serial initialized."));
+    Serial.println(F("setup(): begin"));
+  #endif
+
+  // MCP4151 via HARDWARE SPI
+  //pinMode(MCP_CS_PIN, OUTPUT);
+  //digitalWrite(MCP_CS_PIN, HIGH);
+  //SPI.begin();
+  //SPI.setDataMode(SPI_MODE0);
+  //SPI.setBitOrder(MSBFIRST);
+  //SPI.setClockDivider(SPI_CLOCK_DIV16); // ~1 MHz
+
+  // Software-SPI initialisieren (kein hardware SPI!)
+  potentiometer.begin();
+
+  // LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Encoder
+  pinMode(ENCODER_A, INPUT_PULLUP);
+  pinMode(ENCODER_B, INPUT_PULLUP);
+
+  // Mute-Taster
+  pinMode(ENCODER_SW, INPUT_PULLUP);  // button to GND
+
+  // Initiale stabile Zustände setzen
+  stableClkState = digitalRead(ENCODER_A);
+  stableDtState = digitalRead(ENCODER_B);
+  lastClkState = stableClkState;
+  lastDtState = stableDtState;
+  lastStableChangeTime = micros();
+  
+  // Interrupts auf beide Pins für maximale Reaktionsfähigkeit
+  attachInterrupt(digitalPinToInterrupt(ENCODER_A), encoderInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_B), encoderInterrupt, CHANGE);
+  
+  // Speichere den Anfangszustand von CLK
+  lastClkState = digitalRead(ENCODER_A);
+  lastDtState = digitalRead(ENCODER_B);
+
+  // Initialen Wert MPC4151 setzen
+  potentiometer.setMid();
+
+  pinMode(FET_PIN, OUTPUT);
+  digitalWrite(FET_PIN, LOW);
+
+  #ifdef DEBUG_MODE
+    Serial.println(F("setup(): ready"));  
+  #endif
+
+  // Kurzer LED-Blink als Startbestätigung
+  flashLED(200);
+
+  #ifdef DEBUG_MODE
+    Serial.println(F("Pioneer SWC bereit. Vol+/Vol-/Mute aktiv."));
+  #endif
+
+  //Serial.println("Rotary Encoder LED Blink with Button Reset");
+
+  /* Serial.println("Widerstand auf 24k setzen -> VOL-");
+  sendCommand(POS_VOL_DOWN); // 24kOhm
+  Serial.println("Widerstand auf 16k setzen -> VOL+");
+  sendCommand(POS_VOL_UP); // 16kOhm
+  Serial.println("Widerstand auf 16k setzen -> VOL+");
+  sendCommand(POS_VOL_UP); // 16kOhm */
+}
+
+void loop() {
+
+  // LED automatisch ausschalten
+  if (ledIsOn && (millis() >= ledOffTime)) {
+    digitalWrite(LED_PIN, LOW);
+    ledIsOn = false;
+  }
+
+     // Verweilzeit prüfen (non-blocking)
+    if (isWaiting && (millis() - waitStartTime) >= 1000) {
+        /* potentiometer.setMax();
+        #ifdef DEBUG_MODE
+          Serial.println("-> Nach 1000ms: auf Max gesetzt!");
+        #endif
+        flashLED(200); */
+        isWaiting = false;
+    }
+    
+    // Encoder-Änderung verarbeiten
+    if (encoderChanged && !isWaiting) {
+        noInterrupts();
+        int localValue = encoderValue;
+        encoderChanged = false;
+        interrupts();
+        
+        // Wertebereich begrenzen
+        if (localValue < 0) localValue = 0;
+        if (localValue > 257) localValue = 257;
+        
+        // MCP4151 aktualisieren
+        potentiometer.writeValue(localValue);
+        
+        #ifdef DEBUG_MODE
+          Serial.print("Wiper: ");
+          Serial.println(localValue);
+        #endif
+        
+        // Verweilzeit starten
+        waitStartTime = millis();
+        isWaiting = true;
+        flashLED(50);
+    }
+
+  // ---- Mute-Taster (saubere Flankenauswertung) ---------------
+  bool rawBtn = digitalRead(ENCODER_SW);
+
+  // Änderung erkannt → Timer neu starten
+  if (rawBtn != lastBtnState) {
+    lastBtnTime = millis();
+  }
+  lastBtnState = rawBtn;
+
+  // Erst nach Debounce-Zeit auswerten
+  if ((millis() - lastBtnTime) > BTN_DEBOUNCE) {
+    // Taster gedrückt (LOW) und noch nicht ausgeführt
+    if (rawBtn == LOW && !btnHandled) {
+      #ifdef DEBUG_MODE
+        Serial.println(F("MUTE"));
+      #endif
+      detachInterrupt(digitalPinToInterrupt(ENCODER_A));
+      detachInterrupt(digitalPinToInterrupt(ENCODER_B));
+      sendCommand(POS_MUTE);
+      flashLED(5);
+      btnHandled = true;  // nicht nochmals auslösen bis losgelassen
+    }
+    // Taster losgelassen (HIGH) → 400ms Pause für Encoder
+    if (rawBtn == HIGH && btnHandled) {
+      #ifdef DEBUG_MODE
+        Serial.println(F("BUTTON RELEASED"));
+      #endif
+      btnHandled = false;
+      //detachInterrupt(digitalPinToInterrupt(ENCODER_A));
+      //detachInterrupt(digitalPinToInterrupt(ENCODER_B));
+      delay(400);
+      attachInterrupt(digitalPinToInterrupt(ENCODER_A), encoderInterrupt, CHANGE);
+      attachInterrupt(digitalPinToInterrupt(ENCODER_B), encoderInterrupt, CHANGE);
+    }
+  }
+}
+
+// ============================================================
+// LED-Feedback Funktion
+// ============================================================
+void flashLED(uint16_t durationMs) {
+  digitalWrite(LED_PIN, HIGH);
+  ledIsOn = true;
+  ledOffTime = millis() + durationMs;
+}
+
+// ============================================================
+// Verbesserte Encoder-Interrupt
+// ============================================================
+
+void encoderInterrupt() {
+    unsigned long now = micros();
+    
+    // Lese aktuelle Zustände
+    int clkNow = digitalRead(ENCODER_A);
+    int dtNow = digitalRead(ENCODER_B);
+    
+    // 1. ZUERST: Grobe Entprellung - ignoriere zu schnelle Änderungen (Preller)
+    if ((now - lastStableChangeTime) < DEBOUNCE_TIME_US) {
+        return;  // Zu schnell - das ist ein Preller
+    }
+    
+    // 2. Prüfe auf stabile Zustandsänderung
+    if (clkNow != stableClkState) {
+        stableClkState = clkNow;
+        stableDtState = dtNow;
+        lastStableChangeTime = now;
+        
+        // 3. Zustandsmaschine für zuverlässige Erkennung
+        switch (encState) {
+            case ENC_IDLE:
+                // Warte auf fallende Flanke von CLK (HIGH -> LOW)
+                if (clkNow == LOW && lastClkState == HIGH) {
+                    if (dtNow == HIGH) {
+                        // Mögliche CW Drehung erkannt
+                        encState = ENC_CW_DETECTED;
+                        lastCwTime = now;
+                    } else if (dtNow == LOW) {
+                        // Mögliche CCW Drehung erkannt
+                        encState = ENC_CCW_DETECTED;
+                        lastCcwTime = now;
+                    }
+                }
+                break;
+                
+            case ENC_CW_DETECTED:
+                // Bestätigung: DT muss jetzt LOW sein und genug Zeit muss vergangen sein
+                if (dtNow == LOW && (now - lastCwTime) >= 100) {
+                    encoderValue++;
+                    encoderChanged = true;
+                    logPulseInterval(now);  // <-- Hier der Aufruf
+                    encState = ENC_WAITING_FOR_REST;
+                } else if ((now - lastCwTime) > MAX_PULSE_TIME_US) {
+                    // Timeout - war wohl kein echter Puls
+                    encState = ENC_IDLE;
+                }
+                break;
+                
+            case ENC_CCW_DETECTED:
+                // Bestätigung: DT muss jetzt HIGH sein und genug Zeit muss vergangen sein
+                if (dtNow == HIGH && (now - lastCcwTime) >= 100) {
+                    encoderValue--;
+                    encoderChanged = true;
+                    logPulseInterval(now);  // <-- Hier der Aufruf
+                    encState = ENC_WAITING_FOR_REST;
+                } else if ((now - lastCcwTime) > MAX_PULSE_TIME_US) {
+                    encState = ENC_IDLE;
+                }
+                break;
+                
+            case ENC_WAITING_FOR_REST:
+                // Warte auf Rücksetzung (beide Pins wieder HIGH)
+                if (clkNow == HIGH && dtNow == HIGH) {
+                    // Prüfe auf ausreichenden Abstand zwischen zwei Drehungen
+                    if ((now - lastPulseTime) >= MIN_DETENT_TIME_US) {
+                        encState = ENC_IDLE;
+                        lastPulseTime = now;
+                    }
+                }
+                break;
+        }
+        
+        lastClkState = clkNow;
+        lastDtState = dtNow;
+    }
+}
+
+// ==============================================================
+// Befehl senden: kurzer Impuls, dann Ausgang offen
+void sendCommand(uint8_t pos) {
+  potentiometer.writeValue(pos);
+  //delay(1);
+  delayMicroseconds(5);
+  OUT_ON
+  delay(PULSE_MS);
+  //setWiper(POS_IDLE);
+  OUT_OFF
+  //setIdle();   // statt setWiper(POS_IDLE)
+  //potentiometer.setMax();
+  //delay(1);
+  delayMicroseconds(5);
+}
+
+// Diese Funktion ganz oben bei den anderen Funktionen einfügen
+void logPulseInterval(unsigned long now) {
+    static unsigned long lastPulse = 0;
+    static unsigned long pulseCount = 0;
+    
+    unsigned long pulseInterval = now - lastPulse;
+    lastPulse = now;
+    pulseCount++;
+    
+    // Nur gelegentlich ausgeben, um den Serial-Puffer nicht zu überfluten
+    if (pulseCount % 50 == 0) {
+        Serial.print("Puls-Intervall (us): ");
+        Serial.print(pulseInterval);
+        Serial.print(" | Count: ");
+        Serial.println(pulseCount);
+    }
+}
